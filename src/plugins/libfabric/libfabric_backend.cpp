@@ -470,34 +470,56 @@ nixlLibfabricEngine::getConnInfo(std::string &str) const {
 nixl_status_t
 nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
                                         const std::string &remote_conn_info) {
-    std::lock_guard<std::mutex> lock(connection_state_mutex_);
+    std::shared_ptr<nixlLibfabricConnection> conn_for_handshake;
+    {
+        std::lock_guard<std::mutex> lock(connection_state_mutex_);
 
-    NIXL_DEBUG << "Loading remote info for agent: " << remote_agent
-               << ", info length=" << remote_conn_info.length() << ", info (hex): "
-               << LibfabricUtils::hexdump(remote_conn_info.data(), remote_conn_info.length());
+        NIXL_DEBUG << "Loading remote info for agent: " << remote_agent
+                   << ", info length=" << remote_conn_info.length() << ", info (hex): "
+                   << LibfabricUtils::hexdump(remote_conn_info.data(), remote_conn_info.length());
 
-    if (remote_conn_info.empty()) {
-        NIXL_ERROR << "Empty remote connection info received";
-        return NIXL_ERR_INVALID_PARAM;
+        if (remote_conn_info.empty()) {
+            NIXL_ERROR << "Empty remote connection info received";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+
+        NIXL_DEBUG << "Processing " << rail_manager.getNumRails()
+                   << " rails for agent: " << remote_agent;
+
+        // Use Rail Manager's connection SerDes method with "dest" prefix
+        // (remote is sending us their endpoints as "dest")
+        std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> data_endpoints;
+        nixl_status_t status =
+            rail_manager.deserializeConnectionInfo("dest", remote_conn_info, data_endpoints);
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Rail Manager deserializeConnectionInfo failed";
+            return status;
+        }
+        // Create connection to remote agent using rail 0 for notifications
+        nixl_status_t conn_status = createAgentConnection(remote_agent, data_endpoints);
+        if (conn_status != NIXL_SUCCESS) {
+            NIXL_ERROR << "createAgentConnection failed with status: " << conn_status;
+            return conn_status;
+        }
+
+        // Stash the connection so we can send the handshake AFTER releasing
+        // connection_state_mutex_. Doing it inside the lock would deadlock —
+        // see the note in createAgentConnection for the full chain.
+        if (remote_agent != localAgent) {
+            auto it = connections_.find(remote_agent);
+            if (it != connections_.end()) conn_for_handshake = it->second;
+        }
     }
 
-    NIXL_DEBUG << "Processing " << rail_manager.getNumRails()
-               << " rails for agent: " << remote_agent;
-
-    // Use Rail Manager's connection SerDes method with "dest" prefix (remote is sending us their
-    // endpoints as "dest")
-    std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> data_endpoints;
-    nixl_status_t status =
-        rail_manager.deserializeConnectionInfo("dest", remote_conn_info, data_endpoints);
-    if (status != NIXL_SUCCESS) {
-        NIXL_ERROR << "Rail Manager deserializeConnectionInfo failed";
-        return status;
-    }
-    // Create connection to remote agent using rail 0 for notifications
-    nixl_status_t conn_status = createAgentConnection(remote_agent, data_endpoints);
-    if (conn_status != NIXL_SUCCESS) {
-        NIXL_ERROR << "createAgentConnection failed with status: " << conn_status;
-        return conn_status;
+    // Lock released. Now safe to call libfabric and risk a recursive entry
+    // back into handleHandshake from the same thread.
+    if (conn_for_handshake) {
+        nixl_status_t hs = sendHandshakeTo(*conn_for_handshake);
+        if (hs != NIXL_SUCCESS) {
+            NIXL_WARN << "Handshake send to '" << remote_agent
+                      << "' failed with status " << hs
+                      << "; their first transfers to us will land in the pre-handshake bucket";
+        }
     }
 
     NIXL_INFO << "Successfully stored multirail connection for " << remote_agent << " on "
@@ -613,24 +635,17 @@ nixlLibfabricEngine::createAgentConnection(
     });
     conn->agent_index_ = agent_names_.size() - 1;
 
-    // Store connection BEFORE sending handshake — peer's handshake response
-    // (handleHandshake) needs to find this entry in connections_.
+    // Store connection BEFORE we eventually send the handshake — the peer's
+    // own handshake (which they may already have in-flight back to us) needs
+    // to find this entry in connections_ when its recv completes.
     connections_[agent_name] = conn;
 
-    // Skip handshake for the self-connection — there's no remote endpoint to
-    // send to, and same-process transfers don't go through the imm_data
-    // demux path anyway. (createAgentConnection is called once with
-    // localAgent at engine init.)
+    // Drain any handshake the peer already sent us before we'd registered
+    // them locally — handleHandshake buffered it in pending_inbound_handshakes_.
+    // Safe to do here because we already hold connection_state_mutex_ (so the
+    // peer's handshake recv can't race us looking up `connections_`), and
+    // because we explicitly do NOT touch libfabric inside this block.
     if (agent_name != localAgent) {
-        nixl_status_t hs = sendHandshakeTo(*conn);
-        if (hs != NIXL_SUCCESS) {
-            NIXL_WARN << "Handshake send to '" << agent_name << "' failed with status " << hs
-                      << "; their first transfers to us will land in the pre-handshake bucket";
-        }
-
-        // If this peer's handshake to us arrived BEFORE we added them to
-        // connections_, handleHandshake buffered the assignment. Drain it
-        // now so the connection is fully primed for postXfer/notifSendPriv.
         std::optional<uint16_t> buffered;
         {
             std::lock_guard<std::mutex> plk(pending_handshake_mutex_);
@@ -651,6 +666,14 @@ nixlLibfabricEngine::createAgentConnection(
                       << "' assigned_idx=" << *buffered;
         }
     }
+    // NOTE: the OUTBOUND handshake send is deliberately NOT done here. It is
+    // performed by loadRemoteConnInfo *after* dropping connection_state_mutex_.
+    // Doing it inside this function would deadlock: sendHandshakeTo →
+    // postControlMessage → fi_senddata EAGAIN-retry loop → progressCompletionQueue
+    // → inbound recv → handshakeCallback → handleHandshake → tries to take
+    // connection_state_mutex_ ON THE SAME THREAD (non-recursive → deadlock).
+    // Observed in 4-sender off-mode runs where the local fi_senddata stayed
+    // EAGAIN long enough for a peer's handshake to land mid-retry.
 
     NIXL_INFO << "Successfully created connection for agent: " << agent_name << " on "
               << rail_manager.getNumRails() << " rails";
@@ -1689,17 +1712,40 @@ nixlLibfabricEngine::senderImmDataAgentIdx(nixlLibfabricConnection &conn) const 
     if (conn.handshake_received_.load(std::memory_order_acquire)) {
         return conn.local_agent_idx_at_remote_;
     }
-    // Slow path: wait briefly. In normal NIXL flow both sides do the
-    // metadata exchange first, then createAgentConnection on each side
-    // sends a handshake; latency is usually sub-millisecond. The 5 s cap
-    // is paranoia for stalled peers.
+
     using namespace std::chrono_literals;
-    std::unique_lock<std::mutex> lk(conn.handshake_mutex_);
-    if (conn.handshake_cv_.wait_for(lk, 5s, [&] {
-            return conn.handshake_received_.load(std::memory_order_acquire);
-        })) {
-        return conn.local_agent_idx_at_remote_;
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+
+    if (progress_thread_enabled_) {
+        // Progress-thread is draining the CQ on our behalf — block on the
+        // per-connection cv. handleHandshake() will notify us when the peer's
+        // handshake message lands.
+        std::unique_lock<std::mutex> lk(conn.handshake_mutex_);
+        if (conn.handshake_cv_.wait_until(lk, deadline, [&] {
+                return conn.handshake_received_.load(std::memory_order_acquire);
+            })) {
+            return conn.local_agent_idx_at_remote_;
+        }
+    } else {
+        // No progress thread → nobody else will read the CQ. We have to
+        // drive progressActiveRails ourselves on this thread, otherwise the
+        // peer's handshake completion just sits in the CQ and the cv would
+        // never get notified (the wait_for above would silently hang for
+        // 5s every first xfer). The same lock-free atomic check serves as
+        // the loop-exit condition; we spin with a tiny sleep so we don't
+        // burn a core.
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (conn.handshake_received_.load(std::memory_order_acquire)) {
+                return conn.local_agent_idx_at_remote_;
+            }
+            // Best-effort progress. progressActiveRails() returns NIXL_IN_PROG
+            // when there's nothing pending — that's fine, we just keep
+            // looping until either the handshake lands or the deadline hits.
+            (void)rail_manager.progressActiveRails();
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
     }
+
     NIXL_WARN << "Handshake from peer '" << conn.remoteAgent_
               << "' not received after 5s; falling back to kPreHandshakeAgentIdx"
               << " — receiver will join this xfer in the pre-handshake bucket";
